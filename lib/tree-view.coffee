@@ -3,6 +3,7 @@ shell = require 'shell'
 
 _ = require 'underscore-plus'
 {BufferedProcess, CompositeDisposable} = require 'atom'
+{repoForPath, getStyleObject} = require "./helpers"
 {$, View} = require 'atom-space-pen-views'
 fs = require 'fs-plus'
 
@@ -25,7 +26,7 @@ class TreeView extends View
 
   @content: ->
     @div class: 'tree-view-resizer tool-panel', 'data-show-on-right-side': atom.config.get('tree-view.showOnRightSide'), =>
-      @div class: 'tree-view-scroller', outlet: 'scroller', =>
+      @div class: 'tree-view-scroller order--center', outlet: 'scroller', =>
         @ol class: 'tree-view full-menu list-tree has-collapsable-children focusable-panel', tabindex: -1, outlet: 'list'
       @div class: 'tree-view-resize-handle', outlet: 'resizeHandle'
 
@@ -37,6 +38,8 @@ class TreeView extends View
     @scrollTopAfterAttach = -1
     @selectedPath = null
     @ignoredPatterns = []
+
+    @dragEventCounts = new WeakMap
 
     @handleEvents()
 
@@ -92,8 +95,12 @@ class TreeView extends View
       @entryClicked(e) unless e.shiftKey or e.metaKey or e.ctrlKey
     @on 'mousedown', '.entry', (e) =>
       @onMouseDown(e)
-
     @on 'mousedown', '.tree-view-resize-handle', (e) => @resizeStarted(e)
+    @on 'dragstart', '.entry', (e) => @onDragStart(e)
+    @on 'dragenter', '.entry.directory > .header', (e) => @onDragEnter(e)
+    @on 'dragleave', '.entry.directory > .header', (e) => @onDragLeave(e)
+    @on 'dragover', '.entry', (e) => @onDragOver(e)
+    @on 'drop', '.entry', (e) => @onDrop(e)
 
     atom.commands.add @element,
      'core:move-up': @moveUp.bind(this)
@@ -141,6 +148,8 @@ class TreeView extends View
     @disposables.add atom.config.onDidChange 'tree-view.showOnRightSide', ({newValue}) =>
       @onSideToggled(newValue)
     @disposables.add atom.config.onDidChange 'tree-view.sortFoldersBeforeFiles', =>
+      @updateRoots()
+    @disposables.add atom.config.onDidChange 'tree-view.squashDirectoryNames', =>
       @updateRoots()
 
   toggle: ->
@@ -203,7 +212,7 @@ class TreeView extends View
           if not atom.config.get('tree-view.showFileWhenSelected')
             @openSelectedEntry(false)
           @unfocus()
-        else if DirectoryView
+        else if entry instanceof DirectoryView
           entry.toggleExpansion(isRecursive)
 
     false
@@ -220,9 +229,9 @@ class TreeView extends View
     return @resizeStopped() unless which is 1
 
     if atom.config.get('tree-view.showOnRightSide')
-      width = $(document.body).width() - pageX
+      width = @outerWidth() + @offset().left - pageX
     else
-      width = pageX
+      width = pageX - @offset().left
     @width(width)
 
   resizeToFitContent: ->
@@ -241,7 +250,7 @@ class TreeView extends View
       try
         @ignoredPatterns.push(new Minimatch(ignoredName, matchBase: true, dot: true))
       catch error
-        console.warn "Error parsing ignore pattern (#{ignoredName}): #{error.message}"
+        atom.notifications.addWarning("Error parsing ignore pattern (#{ignoredName})", detail: error.message)
 
   updateRoots: (expansionStates={}) ->
     oldExpansionStates = {}
@@ -288,14 +297,8 @@ class TreeView extends View
 
     return unless activeFilePath = @getActivePath()
 
-    relativePath = null
-    rootPath = null
-    for directory in atom.project.getDirectories()
-      if directory.contains(activeFilePath)
-        rootPath = directory.getPath()
-        relativePath = directory.relativize(activeFilePath)
-        break
-    return unless relativePath?
+    [rootPath, relativePath] = atom.project.relativizePath(activeFilePath)
+    return unless rootPath?
 
     activePathComponents = relativePath.split(path.sep)
     currentPath = rootPath
@@ -530,6 +533,8 @@ class TreeView extends View
         "Move to Trash": ->
           for selectedPath in selectedPaths
             shell.moveItemToTrash(selectedPath)
+            if repo = repoForPath(selectedPath)
+              repo.getPathStatus(selectedPath)
         "Cancel": null
 
   # Public: Copy the path of the selected entry element.
@@ -604,7 +609,7 @@ class TreeView extends View
         else if cutPaths
           # Only move the target if the cut target doesn't exists and if the newPath
           # is not within the initial path
-          unless fs.existsSync(newPath) or !!newPath.match(new RegExp("^#{initialPath}"))
+          unless fs.existsSync(newPath) or newPath.startsWith(initialPath)
             catchAndShowFileErrors -> fs.moveSync(initialPath, newPath)
 
   add: (isCreatingFile) ->
@@ -681,13 +686,31 @@ class TreeView extends View
   toggleSide: ->
     toggleConfig('tree-view.showOnRightSide')
 
+  moveEntry: (initialPath, newDirectoryPath) ->
+    if initialPath is newDirectoryPath
+      return
+
+    entryName = path.basename(initialPath)
+    newPath = "#{newDirectoryPath}/#{entryName}".replace(/\s+$/, '')
+
+    try
+      fs.makeTreeSync(newDirectoryPath) unless fs.existsSync(newDirectoryPath)
+      fs.moveSync(initialPath, newPath)
+
+      if repo = repoForPath(newPath)
+        repo.getPathStatus(initialPath)
+        repo.getPathStatus(newPath)
+
+    catch error
+      atom.notifications.addWarning("Failed to move entry #{initialPath} to #{newDirectoryPath}", detail: error.message)
+
   onStylesheetsChanged: =>
     return unless @isVisible()
 
     # Force a redraw so the scrollbars are styled correctly based on the theme
     @element.style.display = 'none'
     @element.offsetWidth
-    @element.style.display = 'block'
+    @element.style.display = ''
 
   onMouseDown: (e) ->
     e.stopPropagation()
@@ -756,16 +779,12 @@ class TreeView extends View
 
   # Public: Toggle full-menu class on the main list element to display the full context
   #         menu.
-  #
-  # Returns noop
   showFullMenu: ->
     @list[0].classList.remove('multi-select')
     @list[0].classList.add('full-menu')
 
   # Public: Toggle multi-select class on the main list element to display the the
   #         menu with only items that make sense for multi select functionality
-  #
-  # Returns noop
   showMultiSelectMenu: ->
     @list[0].classList.remove('full-menu')
     @list[0].classList.add('multi-select')
@@ -775,3 +794,63 @@ class TreeView extends View
   # Returns boolean
   multiSelectEnabled: ->
     @list[0].classList.contains('multi-select')
+
+  onDragEnter: (e) =>
+    e.stopPropagation()
+    entry = e.currentTarget.parentNode
+    @dragEventCounts.set(entry, 0) unless @dragEventCounts.get(entry)
+    entry.classList.add('selected') if @dragEventCounts.get(entry) is 0
+    @dragEventCounts.set(entry, @dragEventCounts.get(entry) + 1)
+
+  onDragLeave: (e) =>
+    e.stopPropagation()
+    entry = e.currentTarget.parentNode
+    @dragEventCounts.set(entry, @dragEventCounts.get(entry) - 1)
+    entry.classList.remove('selected') if @dragEventCounts.get(entry) is 0
+
+  # Handle entry name object dragstart event
+  onDragStart: (e) ->
+    e.stopPropagation()
+
+    target = $(e.currentTarget).find(".name")
+    initialPath = target.data("path")
+
+    style = getStyleObject(target[0])
+
+    fileNameElement = target.clone()
+      .css(style)
+      .css(
+        position: 'absolute'
+        top: 0
+        left: 0
+      )
+    fileNameElement.appendTo(document.body)
+
+    e.originalEvent.dataTransfer.effectAllowed = "move"
+    e.originalEvent.dataTransfer.setDragImage(fileNameElement[0], 0, 0)
+    e.originalEvent.dataTransfer.setData("initialPath", initialPath)
+
+    window.requestAnimationFrame ->
+      fileNameElement.remove()
+
+  # Handle entry dragover event; reset default dragover actions
+  onDragOver: (e) ->
+    e.preventDefault()
+    e.stopPropagation()
+
+  # Handle entry drop event
+  onDrop: (e) ->
+    e.preventDefault()
+    e.stopPropagation()
+
+    entry = e.currentTarget
+    return unless entry instanceof DirectoryView
+
+    initialPath = e.originalEvent.dataTransfer.getData("initialPath")
+    newDirectoryPath = $(entry).find(".name").data("path")
+
+    entry.classList.remove('selected')
+
+    return false unless newDirectoryPath
+
+    @moveEntry(initialPath, newDirectoryPath)
